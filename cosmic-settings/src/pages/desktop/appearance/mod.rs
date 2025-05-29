@@ -857,6 +857,7 @@ impl Page {
             }
 
             Message::Density(density) => {
+                tracing::info!("Density changed: {:?}", density);
                 needs_sync = true;
 
                 if let Some(config) = self.tk_config.as_mut() {
@@ -2090,8 +2091,11 @@ pub fn interface_density() -> Section<crate::pages::Message> {
         .descriptions(descriptions)
         .view::<Page>(move |_binder, _page, section| {
             let descriptions = &section.descriptions;
-
-            let density = cosmic::config::interface_density();
+            let density = CosmicTk::config()
+                .ok()
+                .unwrap()
+                .get("interface_density")
+                .unwrap();
 
             settings::section()
                 .title(&section.title)
