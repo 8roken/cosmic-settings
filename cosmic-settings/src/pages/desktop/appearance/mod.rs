@@ -4,6 +4,11 @@
 pub mod font_config;
 pub mod icon_themes;
 
+mod density;
+mod mode_and_colors;
+mod style;
+mod window_management;
+
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -19,17 +24,15 @@ use cosmic::cosmic_theme::{
 #[cfg(feature = "xdg-portal")]
 use cosmic::dialog::file_chooser::{self, FileFilter};
 use cosmic::iced_core::{Alignment, Color, Length};
-use cosmic::widget::icon::{from_name, icon};
 use cosmic::widget::{
     ColorPickerModel, button, color_picker::ColorPickerUpdate, container, flex_row,
-    horizontal_space, radio, row, scrollable, settings, text,
+    horizontal_space, row, settings, text,
 };
 use cosmic::{Apply, Element, Task, widget};
 #[cfg(feature = "wayland")]
 use cosmic_panel_config::CosmicPanelConfig;
 use cosmic_settings_page::Section;
 use cosmic_settings_page::{self as page, section};
-use cosmic_settings_wallpaper as wallpaper;
 use icon_themes::{IconHandles, IconThemes};
 use ron::ser::PrettyConfig;
 use serde::Serialize;
@@ -38,8 +41,6 @@ use slotmap::{Key, SlotMap};
 
 use crate::app;
 use crate::widget::color_picker_context_view;
-
-use super::wallpaper::widgets::color_image;
 
 crate::cache_dynamic_lazy! {
     static HEX: String = fl!("hex");
@@ -60,7 +61,6 @@ enum ContextView {
     MonospaceFont,
     SystemFont,
 }
-
 #[allow(clippy::struct_excessive_bools)]
 pub struct Page {
     entity: page::Entity,
@@ -1548,10 +1548,10 @@ impl page::Page<crate::pages::Message> for Page {
         sections: &mut SlotMap<section::Entity, Section<crate::pages::Message>>,
     ) -> Option<page::Content> {
         Some(vec![
-            sections.insert(mode_and_colors()),
-            sections.insert(style()),
-            sections.insert(interface_density()),
-            sections.insert(window_management()),
+            sections.insert(mode_and_colors::render()),
+            sections.insert(style::render()),
+            sections.insert(density::render()),
+            sections.insert(window_management::render()),
             sections.insert(experimental()),
             sections.insert(reset_button()),
         ])
@@ -1733,447 +1733,6 @@ impl page::Page<crate::pages::Message> for Page {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn mode_and_colors() -> Section<crate::pages::Message> {
-    crate::slab!(descriptions {
-        auto_txt = fl!("auto");
-        auto_switch = fl!("auto-switch");
-        accent_color = fl!("accent-color");
-        app_bg = fl!("app-background");
-        container_bg = fl!("container-background");
-        container_bg_desc = fl!("container-background", "desc");
-        text_tint = fl!("text-tint");
-        text_tint_desc = fl!("text-tint", "desc");
-        control_tint = fl!("control-tint");
-        control_tint_desc = fl!("control-tint", "desc");
-        window_hint_toggle = fl!("window-hint-accent-toggle");
-        window_hint = fl!("window-hint-accent");
-        dark = fl!("dark");
-        light = fl!("light");
-    });
-
-    let dark_mode_illustration = from_name("illustration-appearance-mode-dark").handle();
-    let light_mode_illustration = from_name("illustration-appearance-mode-light").handle();
-    let go_next_icon = from_name("go-next-symbolic").handle();
-
-    Section::default()
-        .title(fl!("mode-and-colors"))
-        .descriptions(descriptions)
-        .view::<Page>(move |_binder, page, section| {
-            let Spacing { space_xxs, .. } = cosmic::theme::spacing();
-
-            let descriptions = &section.descriptions;
-            let palette = &page.theme_builder.palette.as_ref();
-            let cur_accent = page
-                .theme_builder
-                .accent
-                .map_or(palette.accent_blue, Srgba::from);
-
-            let accent_palette_values = match (
-                page.theme_mode.is_dark,
-                page.accent_palette.dark.as_ref(),
-                page.accent_palette.light.as_ref(),
-            ) {
-                (true, Some(dark_palette), _) => &dark_palette,
-                (false, _, Some(light_palette)) => &light_palette,
-                _ => &page.accent_palette.theme,
-            };
-
-            let mut accent_palette_row =
-                cosmic::widget::row::with_capacity(accent_palette_values.len());
-
-            for &color in accent_palette_values {
-                accent_palette_row = accent_palette_row.push(color_button(
-                    Some(Message::PaletteAccent(color.into())),
-                    color.into(),
-                    cur_accent == color,
-                    48,
-                    48,
-                ));
-            }
-
-            let accent_color_palette = cosmic::iced::widget::column![
-                text::body(&descriptions[accent_color]),
-                scrollable::horizontal(
-                    accent_palette_row
-                        .push(if let Some(c) = page.custom_accent.get_applied_color() {
-                            container(color_button(
-                                Some(Message::CustomAccent(ColorPickerUpdate::ToggleColorPicker)),
-                                c,
-                                cosmic::iced::Color::from(cur_accent) == c,
-                                48,
-                                48,
-                            ))
-                        } else {
-                            container(
-                                page.custom_accent
-                                    .picker_button(Message::CustomAccent, None)
-                                    .width(Length::Fixed(48.0))
-                                    .height(Length::Fixed(48.0)),
-                            )
-                        })
-                        .padding([0, 0, 16, 0])
-                        .spacing(16)
-                )
-            ]
-            .padding([16, 0, 0, 0])
-            .spacing(space_xxs);
-
-            let mut section = settings::section()
-                .title(&section.title)
-                .add(
-                    container(
-                        cosmic::iced::widget::row![
-                            cosmic::iced::widget::column![
-                                button::custom(
-                                    icon(dark_mode_illustration.clone())
-                                        .width(Length::Fixed(191.0))
-                                        .height(Length::Fixed(100.0))
-                                )
-                                .class(button::ButtonClass::Image)
-                                .padding([8, 0])
-                                .selected(page.theme_mode.is_dark)
-                                .on_press(Message::DarkMode(true)),
-                                text::body(&descriptions[dark])
-                            ]
-                            .spacing(8)
-                            .width(Length::FillPortion(1))
-                            .align_x(Alignment::Center),
-                            cosmic::iced::widget::column![
-                                button::custom(
-                                    icon(light_mode_illustration.clone(),)
-                                        .width(Length::Fixed(191.0))
-                                        .height(Length::Fixed(100.0))
-                                )
-                                .class(button::ButtonClass::Image)
-                                .selected(!page.theme_mode.is_dark)
-                                .padding([8, 0])
-                                .on_press(Message::DarkMode(false)),
-                                text::body(&descriptions[light])
-                            ]
-                            .spacing(8)
-                            .width(Length::FillPortion(1))
-                            .align_x(Alignment::Center)
-                        ]
-                        .spacing(8)
-                        .width(Length::Fixed(478.0))
-                        .align_y(Alignment::Center),
-                    )
-                    .center_x(Length::Fill),
-                )
-                .add(
-                    settings::item::builder(&descriptions[auto_switch])
-                        .description(
-                            if !page.day_time && page.theme_mode.is_dark {
-                                &page.auto_switch_descs[0]
-                            } else if page.day_time && !page.theme_mode.is_dark {
-                                &page.auto_switch_descs[1]
-                            } else if page.day_time && page.theme_mode.is_dark {
-                                &page.auto_switch_descs[2]
-                            } else {
-                                &page.auto_switch_descs[3]
-                            }
-                            .clone(),
-                        )
-                        .toggler(page.theme_mode.auto_switch, Message::Autoswitch),
-                )
-                .add(accent_color_palette)
-                .add(
-                    settings::item::builder(&descriptions[app_bg]).control(
-                        page.application_background
-                            .picker_button(Message::ApplicationBackground, Some(24))
-                            .width(Length::Fixed(48.0))
-                            .height(Length::Fixed(24.0)),
-                    ),
-                )
-                .add(
-                    settings::item::builder(&descriptions[container_bg])
-                        .description(&descriptions[container_bg_desc])
-                        .control(if page.container_background.get_applied_color().is_some() {
-                            Element::from(
-                                page.container_background
-                                    .picker_button(Message::ContainerBackground, Some(24))
-                                    .width(Length::Fixed(48.0))
-                                    .height(Length::Fixed(24.0)),
-                            )
-                        } else {
-                            container(
-                                button::text(&descriptions[auto_txt])
-                                    .trailing_icon(go_next_icon.clone())
-                                    .on_press(Message::ContainerBackground(
-                                        ColorPickerUpdate::ToggleColorPicker,
-                                    )),
-                            )
-                            .into()
-                        }),
-                )
-                .add(
-                    settings::item::builder(&descriptions[text_tint])
-                        .description(&descriptions[text_tint_desc])
-                        .control(
-                            page.interface_text
-                                .picker_button(Message::InterfaceText, Some(24))
-                                .width(Length::Fixed(48.0))
-                                .height(Length::Fixed(24.0)),
-                        ),
-                )
-                .add(
-                    settings::item::builder(&descriptions[control_tint])
-                        .description(&descriptions[control_tint_desc])
-                        .control(
-                            page.control_component
-                                .picker_button(Message::ControlComponent, Some(24))
-                                .width(Length::Fixed(48.0))
-                                .height(Length::Fixed(24.0)),
-                        ),
-                )
-                .add(
-                    settings::item::builder(&descriptions[window_hint_toggle])
-                        .toggler(page.no_custom_window_hint, Message::UseDefaultWindowHint),
-                );
-            if !page.no_custom_window_hint {
-                section = section.add(
-                    settings::item::builder(&descriptions[window_hint]).control(
-                        page.accent_window_hint
-                            .picker_button(Message::AccentWindowHint, Some(24))
-                            .width(Length::Fixed(48.0))
-                            .height(Length::Fixed(24.0)),
-                    ),
-                );
-            }
-            section
-                .apply(Element::from)
-                .map(crate::pages::Message::Appearance)
-        })
-}
-
-#[allow(clippy::too_many_lines)]
-pub fn style() -> Section<crate::pages::Message> {
-    let mut descriptions = Slab::new();
-
-    let round = descriptions.insert(fl!("style", "round"));
-    let slightly_round = descriptions.insert(fl!("style", "slightly-round"));
-    let square = descriptions.insert(fl!("style", "square"));
-
-    let dark_round_style = from_name("illustration-appearance-dark-style-round").handle();
-    let light_round_style = from_name("illustration-appearance-light-style-round").handle();
-
-    let dark_slightly_round_style =
-        from_name("illustration-appearance-dark-style-slightly-round").handle();
-    let light_slightly_round_style =
-        from_name("illustration-appearance-light-style-slightly-round").handle();
-
-    let dark_square_style = from_name("illustration-appearance-dark-style-square").handle();
-    let light_square_style = from_name("illustration-appearance-light-style-square").handle();
-
-    fn style_container() -> cosmic::theme::Container<'static> {
-        cosmic::theme::Container::custom(|theme| {
-            let mut background = theme.cosmic().palette.neutral_9;
-            background.alpha = 0.1;
-            container::Style {
-                background: Some(cosmic::iced::Background::Color(background.into())),
-                border: cosmic::iced::Border {
-                    radius: theme.cosmic().radius_s().into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        })
-    }
-
-    Section::default()
-        .title(fl!("style"))
-        .descriptions(descriptions)
-        .view::<Page>(move |_binder, page, section| {
-            let descriptions = &section.descriptions;
-
-            settings::section()
-                .title(&section.title)
-                .add(
-                    container(
-                        cosmic::iced::widget::row![
-                            cosmic::iced::widget::column![
-                                button::custom(
-                                    icon(
-                                        if page.theme_mode.is_dark {
-                                            &dark_round_style
-                                        } else {
-                                            &light_round_style
-                                        }
-                                        .clone()
-                                    )
-                                    .width(Length::Fill)
-                                    .height(Length::Fixed(100.0))
-                                )
-                                .selected(matches!(page.roundness, Roundness::Round))
-                                .class(button::ButtonClass::Image)
-                                .padding(0)
-                                .on_press(Message::Roundness(Roundness::Round))
-                                .apply(container)
-                                .width(Length::Fixed(191.0))
-                                .class(style_container()),
-                                text::body(&descriptions[round])
-                            ]
-                            .spacing(8)
-                            .width(Length::FillPortion(1))
-                            .align_x(Alignment::Center),
-                            cosmic::iced::widget::column![
-                                button::custom(
-                                    icon(
-                                        if page.theme_mode.is_dark {
-                                            &dark_slightly_round_style
-                                        } else {
-                                            &light_slightly_round_style
-                                        }
-                                        .clone()
-                                    )
-                                    .width(Length::Fill)
-                                    .height(Length::Fixed(100.0))
-                                )
-                                .selected(matches!(page.roundness, Roundness::SlightlyRound))
-                                .class(button::ButtonClass::Image)
-                                .padding(0)
-                                .on_press(Message::Roundness(Roundness::SlightlyRound))
-                                .apply(container)
-                                .width(Length::Fixed(191.0))
-                                .class(style_container()),
-                                text::body(&descriptions[slightly_round])
-                            ]
-                            .spacing(8)
-                            .width(Length::FillPortion(1))
-                            .align_x(Alignment::Center),
-                            cosmic::iced::widget::column![
-                                button::custom(
-                                    icon(
-                                        if page.theme_mode.is_dark {
-                                            &dark_square_style
-                                        } else {
-                                            &light_square_style
-                                        }
-                                        .clone()
-                                    )
-                                    .width(Length::Fill)
-                                    .height(Length::Fixed(100.0))
-                                )
-                                .width(Length::FillPortion(1))
-                                .selected(matches!(page.roundness, Roundness::Square))
-                                .class(button::ButtonClass::Image)
-                                .padding(0)
-                                .on_press(Message::Roundness(Roundness::Square))
-                                .apply(container)
-                                .width(Length::Fixed(191.0))
-                                .class(style_container()),
-                                text::body(&descriptions[square])
-                            ]
-                            .spacing(8)
-                            .align_x(Alignment::Center)
-                            .width(Length::FillPortion(1))
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    )
-                    .center_x(Length::Fill),
-                )
-                .apply(Element::from)
-                .map(crate::pages::Message::Appearance)
-        })
-}
-
-pub fn interface_density() -> Section<crate::pages::Message> {
-    crate::slab!(descriptions {
-        comfortable = fl!("interface-density", "comfortable");
-        compact = fl!("interface-density", "compact");
-        spacious = fl!("interface-density", "spacious");
-    });
-
-    Section::default()
-        .title(fl!("interface-density"))
-        .descriptions(descriptions)
-        .view::<Page>(move |_binder, _page, section| {
-            let descriptions = &section.descriptions;
-            let density = CosmicTk::config()
-                .ok()
-                .unwrap()
-                .get("interface_density")
-                .unwrap();
-
-            settings::section()
-                .title(&section.title)
-                .add(settings::item_row(vec![
-                    radio(
-                        text::body(&descriptions[compact]),
-                        Density::Compact,
-                        Some(density),
-                        Message::Density,
-                    )
-                    .width(Length::Fill)
-                    .into(),
-                ]))
-                .add(settings::item_row(vec![
-                    radio(
-                        text::body(&descriptions[comfortable]),
-                        Density::Standard,
-                        Some(density),
-                        Message::Density,
-                    )
-                    .width(Length::Fill)
-                    .into(),
-                ]))
-                .add(settings::item_row(vec![
-                    radio(
-                        text::body(&descriptions[spacious]),
-                        Density::Spacious,
-                        Some(density),
-                        Message::Density,
-                    )
-                    .width(Length::Fill)
-                    .into(),
-                ]))
-                .apply(Element::from)
-                .map(crate::pages::Message::Appearance)
-        })
-}
-
-#[allow(clippy::too_many_lines)]
-pub fn window_management() -> Section<crate::pages::Message> {
-    let mut descriptions = Slab::new();
-
-    let active_hint = descriptions.insert(fl!("window-management-appearance", "active-hint"));
-    let gaps = descriptions.insert(fl!("window-management-appearance", "gaps"));
-
-    Section::default()
-        .title(fl!("window-management-appearance"))
-        .descriptions(descriptions)
-        .view::<Page>(move |_binder, page, section| {
-            let descriptions = &section.descriptions;
-
-            settings::section()
-                .title(&section.title)
-                .add(settings::item::builder(&descriptions[active_hint]).control(
-                    widget::spin_button(
-                        page.theme_builder.active_hint.to_string(),
-                        page.theme_builder.active_hint,
-                        1,
-                        0,
-                        64,
-                        Message::WindowHintSize,
-                    ),
-                ))
-                .add(
-                    settings::item::builder(&descriptions[gaps]).control(widget::spin_button(
-                        page.theme_builder.gaps.1.to_string(),
-                        page.theme_builder.gaps.1,
-                        1,
-                        page.theme_builder.active_hint,
-                        500,
-                        Message::GapSize,
-                    )),
-                )
-                .apply(Element::from)
-                .map(crate::pages::Message::Appearance)
-        })
-}
-
 pub fn experimental() -> Section<crate::pages::Message> {
     crate::slab!(descriptions {
         interface_font_txt = fl!("interface-font");
@@ -2235,26 +1794,3 @@ pub fn reset_button() -> Section<crate::pages::Message> {
         })
 }
 impl page::AutoBind<crate::pages::Message> for Page {}
-
-/// A button for selecting a color or gradient.
-pub fn color_button<'a, Message: 'a + Clone>(
-    on_press: Option<Message>,
-    color: cosmic::iced::Color,
-    selected: bool,
-    width: u16,
-    height: u16,
-) -> Element<'a, Message> {
-    button::custom(color_image(
-        wallpaper::Color::Single([color.r, color.g, color.b]),
-        width,
-        height,
-        None,
-    ))
-    .padding(0)
-    .selected(selected)
-    .class(button::ButtonClass::Image)
-    .on_press_maybe(on_press)
-    .width(Length::Fixed(f32::from(width)))
-    .height(Length::Fixed(f32::from(height)))
-    .into()
-}
