@@ -3,6 +3,7 @@
 
 pub mod font_config;
 pub mod icon_themes;
+pub mod theme_manager;
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -10,12 +11,9 @@ use std::sync::Arc;
 use cosmic::app::{ContextDrawer, context_drawer};
 //TODO: use embedded cosmic-files for portability
 use cosmic::config::CosmicTk;
-use cosmic::cosmic_config::{Config, ConfigGet, ConfigSet, CosmicConfigEntry};
+use cosmic::cosmic_config::{Config, ConfigSet, CosmicConfigEntry};
 use cosmic::cosmic_theme::palette::{FromColor, Hsv, Srgb, Srgba};
-use cosmic::cosmic_theme::{
-    CornerRadii, DARK_THEME_BUILDER_ID, Density, LIGHT_THEME_BUILDER_ID, Spacing, Theme,
-    ThemeBuilder, ThemeMode,
-};
+use cosmic::cosmic_theme::{CornerRadii, Density, Spacing, Theme, ThemeBuilder};
 #[cfg(feature = "xdg-portal")]
 use cosmic::dialog::file_chooser::{self, FileFilter};
 use cosmic::iced_core::{Alignment, Color, Length};
@@ -35,6 +33,8 @@ use ron::ser::PrettyConfig;
 use serde::Serialize;
 use slab::Slab;
 use slotmap::{Key, SlotMap};
+use theme_manager::ThemeCustomizer;
+use udev::ffi::udev_list_entry_get_value;
 
 use crate::app;
 use crate::widget::color_picker_context_view;
@@ -65,9 +65,7 @@ enum ContextView {
 pub struct Page {
     entity: page::Entity,
     on_enter_handle: Option<cosmic::iced::task::Handle>,
-    accent_palette: AccentPalette,
     can_reset: bool,
-    no_custom_window_hint: bool,
     context_view: Option<ContextView>,
     custom_accent: ColorPickerModel,
     accent_window_hint: ColorPickerModel,
@@ -90,130 +88,26 @@ pub struct Page {
     icon_themes: IconThemes,
     icon_handles: IconHandles,
 
-    theme: Theme,
-    theme_mode: ThemeMode,
-    theme_mode_config: Option<Config>,
-    theme_builder: ThemeBuilder,
-    theme_builder_config: Option<Config>,
+    theme_manager: theme_manager::Manager,
 
     auto_switch_descs: [Cow<'static, str>; 4],
 
     tk_config: Option<Config>,
-    settings_config: crate::config::Config,
     day_time: bool,
-}
-
-#[derive(Default)]
-pub struct AccentPalette {
-    dark: Option<Vec<Srgba>>,
-    light: Option<Vec<Srgba>>,
-    theme: Vec<Srgba>,
 }
 
 impl Default for Page {
     fn default() -> Self {
-        let settings_config = crate::config::Config::new();
-
-        let theme_mode_config = ThemeMode::config().ok();
-        let theme_mode = theme_mode_config
-            .as_ref()
-            .map(|c| match ThemeMode::get_entry(c) {
-                Ok(t) => t,
-                Err((errors, t)) => {
-                    for e in errors {
-                        tracing::error!("{e}");
-                    }
-                    t
-                }
-            })
-            .unwrap_or_default();
-
-        let accent_palette = AccentPalette {
-            dark: settings_config.accent_palette_dark().ok(),
-            light: settings_config.accent_palette_light().ok(),
-            theme: Vec::new(),
-        };
-
-        let mut page: Page = (
-            settings_config,
-            theme_mode_config,
-            theme_mode,
-            accent_palette,
-        )
-            .into();
-        page.update_accent_palette();
-        page
+        theme_manager::Manager::default().into()
     }
 }
 
-impl
-    From<(
-        crate::config::Config,
-        Option<Config>,
-        ThemeMode,
-        Option<Config>,
-        ThemeBuilder,
-        Option<Config>,
-        AccentPalette,
-    )> for Page
-{
-    fn from(
-        (
-            settings_config,
-            theme_mode_config,
-            theme_mode,
-            theme_builder_config,
-            mut theme_builder,
-            tk_config,
-            accent_palette,
-        ): (
-            crate::config::Config,
-            Option<Config>,
-            ThemeMode,
-            Option<Config>,
-            ThemeBuilder,
-            Option<Config>,
-            AccentPalette,
-        ),
-    ) -> Self {
-        let theme = if let Ok(c) = if theme_mode.is_dark {
-            Theme::dark_config()
-        } else {
-            Theme::light_config()
-        } {
-            Theme::get_entry(&c).unwrap_or_default()
-        } else {
-            if theme_mode.is_dark {
-                Theme::dark_default()
-            } else {
-                Theme::light_default()
-            }
-        };
-        theme_builder = theme_builder
-            .clone()
-            .accent(theme.accent.base.color)
-            .bg_color(theme.bg_color())
-            .corner_radii(theme.corner_radii)
-            .destructive(theme.destructive.base.color)
-            .spacing(theme.spacing)
-            .success(theme.success.base.color)
-            .warning(theme.warning.base.color)
-            .neutral_tint(theme.palette.neutral_5.color)
-            .text_tint(theme.background.on.color);
-        theme_builder.gaps = theme.gaps;
-
-        let custom_accent = theme_builder.accent.filter(|c| {
-            let c = Srgba::new(c.red, c.green, c.blue, 1.0);
-            c != theme.palette.accent_blue
-                && c != theme.palette.accent_green
-                && c != theme.palette.accent_indigo
-                && c != theme.palette.accent_orange
-                && c != theme.palette.accent_pink
-                && c != theme.palette.accent_purple
-                && c != theme.palette.accent_red
-                && c != theme.palette.accent_warm_grey
-                && c != theme.palette.accent_yellow
-        });
+impl From<theme_manager::Manager> for Page {
+    fn from(theme_manager: theme_manager::Manager) -> Self {
+        let tk_config = CosmicTk::config().ok();
+        let theme_mode = theme_manager.mode();
+        let theme = theme_manager.theme().clone();
+        let theme_builder = theme_manager.builder().clone();
 
         Self {
             entity: page::Entity::null(),
@@ -230,7 +124,7 @@ impl
                 &*HEX,
                 &*RGB,
                 None,
-                custom_accent.map(Color::from),
+                theme_manager.custom_accent().map(Color::from),
             ),
             application_background: ColorPickerModel::new(
                 &*HEX,
@@ -262,7 +156,6 @@ impl
                 None,
                 theme_builder.window_hint.map(Color::from),
             ),
-            no_custom_window_hint: theme_builder.window_hint.is_none(),
             font_config: font_config::Model::new(),
             font_filter: Vec::new(),
             font_search: String::new(),
@@ -271,14 +164,8 @@ impl
             icon_theme_active: None,
             icon_themes: Vec::new(),
             icon_handles: Vec::new(),
-            accent_palette,
-            theme,
-            theme_mode_config,
-            theme_builder_config,
-            theme_mode,
-            theme_builder,
+            theme_manager,
             tk_config,
-            settings_config,
             day_time: true,
             auto_switch_descs: [
                 fl!("auto-switch", "sunrise").into(),
@@ -287,61 +174,6 @@ impl
                 fl!("auto-switch", "next-sunset").into(),
             ],
         }
-    }
-}
-
-impl
-    From<(
-        crate::config::Config,
-        Option<Config>,
-        ThemeMode,
-        AccentPalette,
-    )> for Page
-{
-    fn from(
-        (settings_config, theme_mode_config, theme_mode, accent_palette): (
-            crate::config::Config,
-            Option<Config>,
-            ThemeMode,
-            AccentPalette,
-        ),
-    ) -> Self {
-        let theme_builder_config = if theme_mode.is_dark {
-            ThemeBuilder::dark_config()
-        } else {
-            ThemeBuilder::light_config()
-        }
-        .ok();
-        let theme_builder = theme_builder_config.as_ref().map_or_else(
-            || {
-                if theme_mode.is_dark {
-                    ThemeBuilder::dark()
-                } else {
-                    ThemeBuilder::light()
-                }
-            },
-            |c| match ThemeBuilder::get_entry(c) {
-                Ok(t) => t,
-                Err((errors, t)) => {
-                    for e in errors {
-                        tracing::error!("{e}");
-                    }
-                    t
-                }
-            },
-        );
-
-        let tk_config = CosmicTk::config().ok();
-
-        Self::from((
-            settings_config,
-            theme_mode_config,
-            theme_mode,
-            theme_builder_config,
-            theme_builder,
-            tk_config,
-            accent_palette,
-        ))
     }
 }
 
@@ -529,7 +361,6 @@ impl Page {
         let mut tasks = Vec::new();
 
         let mut needs_build = false;
-        let mut needs_sync = false;
 
         match message {
             Message::DisplayMonoFont => {
@@ -600,58 +431,40 @@ impl Page {
             }
 
             Message::NewTheme(theme) => {
-                self.theme = *theme;
-                self.theme_builder = self
-                    .theme_builder
-                    .clone()
-                    .accent(self.theme.accent.base.color)
-                    .bg_color(self.theme.bg_color())
-                    .corner_radii(self.theme.corner_radii)
-                    .destructive(self.theme.destructive.base.color)
-                    .spacing(self.theme.spacing)
-                    .success(self.theme.success.base.color)
-                    .warning(self.theme.warning.base.color)
-                    .neutral_tint(self.theme.palette.neutral_5.color)
-                    .text_tint(self.theme.background.on.color);
-                self.theme_builder.gaps = self.theme.gaps;
+                if *self.theme_manager.theme() != *theme {
+                    let mut customizer = self.theme_manager.selected_customizer();
+                    customizer.replace_theme(*theme);
+                }
+
+                tasks.push(cosmic::task::message(app::Message::SetTheme(
+                    self.theme_manager.cosmic_theme(),
+                )));
             }
+            Message::Autoswitch(enabled) => self.theme_manager.auto_switch(enabled),
             Message::DarkMode(enabled) => {
-                if let Some(config) = self.theme_mode_config.as_ref() {
-                    if let Err(err) = self.theme_mode.set_is_dark(config, enabled) {
-                        tracing::error!(?err, "Error setting dark mode");
-                    }
-
-                    self.reload_theme_mode();
+                if let Err(err) = self.theme_manager.dark_mode(enabled) {
+                    tracing::error!(?err, "Error setting dark mode");
                 }
-            }
 
-            Message::Autoswitch(enabled) => {
-                self.theme_mode.auto_switch = enabled;
-                if let Some(config) = self.theme_mode_config.as_ref() {
-                    _ = config.set::<bool>("auto_switch", enabled);
-                }
+                tasks.push(cosmic::task::message(app::Message::SetTheme(
+                    self.theme_manager.cosmic_theme(),
+                )));
             }
 
             Message::AccentWindowHint(u) => {
-                needs_sync = true;
-
                 let (task, needs_update) =
                     self.update_color_picker(&u, ContextView::AccentWindowHint);
 
                 tasks.push(task);
                 tasks.push(self.accent_window_hint.update::<app::Message>(u));
 
-                if needs_update {
-                    let Some(config) = self.theme_builder_config.as_ref() else {
-                        return cosmic::Task::batch(tasks);
-                    };
-
-                    let color = self.accent_window_hint.get_applied_color().map(Srgb::from);
-
-                    needs_build = self
-                        .theme_builder
-                        .set_window_hint(config, color)
-                        .unwrap_or_default();
+                let color = self.accent_window_hint.get_applied_color().map(Srgb::from);
+                if let None = self
+                    .theme_manager
+                    .selected_customizer()
+                    .set_window_hint(color)
+                {
+                    return cosmic::Task::batch(tasks);
                 }
             }
 
@@ -668,58 +481,15 @@ impl Page {
             }
 
             Message::WindowHintSize(active_hint) => {
-                needs_sync = true;
-
-                let Some(config) = self.theme_builder_config.as_ref() else {
-                    return Task::none();
-                };
-
-                if self
-                    .theme_builder
-                    .set_active_hint(config, active_hint)
-                    .unwrap_or_default()
-                {
-                    // Update the gap if it's less than the active hint
-                    if active_hint > self.theme_builder.gaps.1 {
-                        let mut gaps = self.theme_builder.gaps;
-                        gaps.1 = active_hint;
-                        if self
-                            .theme_builder
-                            .set_gaps(config, gaps)
-                            .unwrap_or_default()
-                        {
-                            self.theme_config_write("gaps", gaps);
-                        }
-                    }
-
-                    // Update the active_hint in the config
-                    self.theme_config_write("active_hint", active_hint);
-                }
+                self.theme_manager.apply_to_all_customizers(|customizer| {
+                    _ = customizer.set_active_hint(active_hint)
+                });
             }
 
             Message::GapSize(gap) => {
-                needs_sync = true;
-
-                let Some(config) = self.theme_builder_config.as_ref() else {
-                    return Task::none();
-                };
-
-                let mut gaps = self.theme_builder.gaps;
-
-                // Ensure that the gap is never less than what the active hint size is.
-                gaps.1 = if gap < self.theme_builder.active_hint {
-                    self.theme_builder.active_hint
-                } else {
-                    gap
-                };
-
-                if self
-                    .theme_builder
-                    .set_gaps(config, gaps)
-                    .unwrap_or_default()
-                {
-                    self.theme_config_write("gaps", gaps);
-                }
+                self.theme_manager.apply_to_all_customizers(|customizer| {
+                    customizer.set_gap_size(gap);
+                });
             }
 
             Message::ApplicationBackground(u) => {
@@ -730,19 +500,14 @@ impl Page {
                 tasks.push(self.application_background.update::<app::Message>(u));
 
                 if needs_update {
-                    let Some(config) = self.theme_builder_config.as_ref() else {
-                        return cosmic::Task::batch(tasks);
-                    };
-
-                    needs_build = self
-                        .theme_builder
-                        .set_bg_color(
-                            config,
-                            self.application_background
-                                .get_applied_color()
-                                .map(Srgba::from),
-                        )
-                        .unwrap_or_default();
+                    match self.theme_manager.selected_customizer().set_bg_color(
+                        self.application_background
+                            .get_applied_color()
+                            .map(Srgba::from),
+                    ) {
+                        None => return cosmic::Task::batch(tasks),
+                        Some(updated) => needs_build = updated,
+                    }
                 }
             }
 
@@ -754,19 +519,17 @@ impl Page {
                 tasks.push(self.container_background.update::<app::Message>(u));
 
                 if needs_update {
-                    let Some(config) = self.theme_builder_config.as_ref() else {
-                        return cosmic::Task::batch(tasks);
-                    };
-
-                    needs_build = self
-                        .theme_builder
+                    match self
+                        .theme_manager
+                        .selected_customizer()
                         .set_primary_container_bg(
-                            config,
                             self.container_background
                                 .get_applied_color()
                                 .map(Srgba::from),
-                        )
-                        .unwrap_or_default();
+                        ) {
+                        None => return cosmic::Task::batch(tasks),
+                        Some(updated) => needs_build = updated,
+                    }
                 }
             }
 
@@ -777,17 +540,14 @@ impl Page {
                 tasks.push(self.custom_accent.update::<app::Message>(u));
 
                 if needs_update {
-                    let Some(config) = self.theme_builder_config.as_ref() else {
-                        return cosmic::Task::batch(tasks);
-                    };
-
-                    needs_build = self
-                        .theme_builder
-                        .set_accent(
-                            config,
-                            self.custom_accent.get_applied_color().map(Srgb::from),
-                        )
-                        .unwrap_or_default();
+                    match self
+                        .theme_manager
+                        .selected_customizer()
+                        .set_accent(self.custom_accent.get_applied_color().map(Srgb::from))
+                    {
+                        None => return cosmic::Task::batch(tasks),
+                        Some(updated) => needs_build = updated,
+                    }
                 }
             }
 
@@ -798,17 +558,14 @@ impl Page {
                 tasks.push(self.interface_text.update::<app::Message>(u));
 
                 if needs_update {
-                    let Some(config) = self.theme_builder_config.as_ref() else {
-                        return cosmic::Task::batch(tasks);
-                    };
-
-                    needs_build = self
-                        .theme_builder
-                        .set_text_tint(
-                            config,
-                            self.interface_text.get_applied_color().map(Srgb::from),
-                        )
-                        .unwrap_or_default();
+                    match self
+                        .theme_manager
+                        .selected_customizer()
+                        .set_text_tint(self.interface_text.get_applied_color().map(Srgb::from))
+                    {
+                        None => return cosmic::Task::batch(tasks),
+                        Some(updated) => needs_build = updated,
+                    }
                 }
             }
 
@@ -820,36 +577,26 @@ impl Page {
                 tasks.push(self.control_component.update::<app::Message>(u));
 
                 if needs_update {
-                    let Some(config) = self.theme_builder_config.as_ref() else {
-                        return cosmic::Task::batch(tasks);
-                    };
-
-                    needs_build = self
-                        .theme_builder
-                        .set_neutral_tint(
-                            config,
-                            self.control_component.get_applied_color().map(Srgb::from),
-                        )
-                        .unwrap_or_default();
+                    match self.theme_manager.selected_customizer().set_neutral_tint(
+                        self.control_component.get_applied_color().map(Srgb::from),
+                    ) {
+                        None => return cosmic::Task::batch(tasks),
+                        Some(updated) => needs_build = updated,
+                    }
                 }
             }
 
             Message::Roundness(r) => {
-                needs_sync = true;
                 self.roundness = r;
-
-                let Some(config) = self.theme_builder_config.as_ref() else {
-                    return Task::none();
-                };
 
                 let radii = self.roundness.into();
 
-                if self
-                    .theme_builder
-                    .set_corner_radii(config, radii)
-                    .unwrap_or_default()
+                if let None = self
+                    .theme_manager
+                    .selected_customizer()
+                    .set_corner_radii(radii)
                 {
-                    self.theme_config_write("corner_radii", radii);
+                    return Task::none();
                 }
 
                 #[cfg(feature = "wayland")]
@@ -860,7 +607,6 @@ impl Page {
 
             Message::Density(density) => {
                 tracing::info!("Density changed: {:?}", density);
-                needs_sync = true;
                 self.density = density;
 
                 if let Some(config) = self.tk_config.as_mut() {
@@ -868,19 +614,14 @@ impl Page {
                     _ = config.set("header_size", density);
                 }
 
-                let Some(config) = self.theme_builder_config.as_ref() else {
-                    return Task::none();
-                };
-
                 let spacing = density.into();
 
-                if self
-                    .theme_builder
-                    .set_spacing(config, spacing)
-                    .unwrap_or_default()
-                {
-                    self.theme_config_write("spacing", spacing);
-                }
+                self.theme_manager
+                    .apply_to_all_customizers(|customizer| _ = customizer.set_spacing(spacing));
+
+                tasks.push(cosmic::task::message(app::Message::SetTheme(
+                    self.theme_manager.cosmic_theme(),
+                )));
 
                 #[cfg(feature = "wayland")]
                 tokio::task::spawn(async move {
@@ -907,80 +648,30 @@ impl Page {
             }
 
             Message::PaletteAccent(c) => {
-                let Some(config) = self.theme_builder_config.as_ref() else {
-                    return Task::none();
-                };
-
-                needs_build = self
-                    .theme_builder
-                    .set_accent(config, Some(c.into()))
-                    .unwrap_or_default();
+                match self
+                    .theme_manager
+                    .selected_customizer()
+                    .set_accent(Some(c).map(Srgb::from))
+                {
+                    None => return Task::none(),
+                    Some(updated) => needs_build = updated,
+                }
             }
 
             Message::Reset => {
-                self.theme_builder = if self.theme_mode.is_dark {
-                    cosmic::cosmic_config::Config::system(
-                        DARK_THEME_BUILDER_ID,
-                        ThemeBuilder::VERSION,
-                    )
-                    .map_or_else(
-                        |_| ThemeBuilder::dark(),
-                        |config| match ThemeBuilder::get_entry(&config) {
-                            Ok(t) => t,
-                            Err((errs, t)) => {
-                                for err in errs {
-                                    tracing::warn!(?err, "Error getting system theme builder");
-                                }
-                                t
-                            }
-                        },
-                    )
-                } else {
-                    cosmic::cosmic_config::Config::system(
-                        LIGHT_THEME_BUILDER_ID,
-                        ThemeBuilder::VERSION,
-                    )
-                    .map_or_else(
-                        |_| ThemeBuilder::light(),
-                        |config| match ThemeBuilder::get_entry(&config) {
-                            Ok(t) => t,
-                            Err((errs, t)) => {
-                                for err in errs {
-                                    tracing::warn!(?err, "Error getting system theme builder");
-                                }
-                                t
-                            }
-                        },
-                    )
-                };
-                if let Some(config) = self.theme_builder_config.as_ref() {
-                    _ = self.theme_builder.write_entry(config);
-                };
+                // self.theme_manager.reset_theme();
                 if let Some(config) = self.tk_config.as_mut() {
                     _ = config.set("interface_density", Density::Standard);
                     _ = config.set("header_size", Density::Standard);
                 }
 
-                let config = if self.theme_mode.is_dark {
-                    Theme::dark_config()
-                } else {
-                    Theme::light_config()
-                };
-                let new_theme = self.theme_builder.clone().build();
-                if let Ok(config) = config {
-                    _ = new_theme.write_entry(&config);
-                } else {
-                    tracing::error!("Failed to get the theme config.");
-                }
-
                 let r = self.roundness;
+
                 #[cfg(feature = "wayland")]
                 tokio::task::spawn(async move {
                     Self::update_panel_radii(r);
                     Self::update_panel_spacing(Density::Standard);
                 });
-
-                self.reload_theme_mode();
             }
 
             #[cfg(feature = "xdg-portal")]
@@ -1004,7 +695,7 @@ impl Page {
 
             #[cfg(feature = "xdg-portal")]
             Message::StartExport => {
-                let is_dark = self.theme_mode.is_dark;
+                let is_dark = self.theme_manager.mode().is_dark;
                 let name = format!("{}.ron", if is_dark { fl!("dark") } else { fl!("light") });
 
                 tasks.push(cosmic::task::future(async move {
@@ -1062,7 +753,7 @@ impl Page {
                     return Task::none();
                 };
 
-                let theme_builder = self.theme_builder.clone();
+                let theme_builder = self.theme_manager.builder().clone();
 
                 tasks.push(cosmic::task::future(async move {
                     let Ok(builder) =
@@ -1097,76 +788,43 @@ impl Page {
             #[cfg(feature = "xdg-portal")]
             Message::ImportSuccess(builder) => {
                 tracing::trace!("Import successful");
-                self.theme_builder = *builder;
+                self.theme_manager
+                    .selected_customizer()
+                    .replace_builder(*builder);
 
-                if let Some(config) = self.theme_builder_config.as_ref() {
-                    _ = self.theme_builder.write_entry(config);
-                };
-
-                let config = if self.theme_mode.is_dark {
-                    Theme::dark_config()
-                } else {
-                    Theme::light_config()
-                };
-                let new_theme = self.theme_builder.clone().build();
-                if let Ok(config) = config {
-                    _ = new_theme.write_entry(&config);
-                } else {
-                    tracing::error!("Failed to get the theme config.");
-                }
-
-                self.reload_theme_mode();
+                needs_build = true;
             }
 
             Message::UseDefaultWindowHint(v) => {
-                self.no_custom_window_hint = v;
-
-                let Some(config) = self.theme_builder_config.as_ref() else {
+                if !v {
+                    self.theme_manager
+                        .selected_customizer()
+                        .set_window_hint(None)
+                        .is_some_and(|_| true);
                     return Task::none();
-                };
+                }
+
+                let theme = self.theme_manager.theme();
+                let window_hint = self
+                    .theme_manager
+                    .builder()
+                    .window_hint
+                    .or(self.theme_manager.builder().accent);
+
+                _ = self
+                    .accent_window_hint
+                    .update::<app::Message>(ColorPickerUpdate::ActiveColor(Hsv::from_color(
+                        window_hint.unwrap_or_default(),
+                    )));
+
+                _ = self
+                    .accent_window_hint
+                    .update::<app::Message>(ColorPickerUpdate::AppliedColor);
 
                 needs_build = self
-                    .theme_builder
-                    .set_window_hint(
-                        config,
-                        if v {
-                            None
-                        } else {
-                            let theme = if self.theme_mode.is_dark {
-                                Theme::dark_default()
-                            } else {
-                                Theme::light_default()
-                            };
-
-                            let window_hint = self
-                                .theme_builder
-                                .window_hint
-                                .filter(|c| {
-                                    let c = Srgba::new(c.red, c.green, c.blue, 1.0);
-                                    c != theme.palette.accent_blue
-                                        && c != theme.palette.accent_green
-                                        && c != theme.palette.accent_indigo
-                                        && c != theme.palette.accent_orange
-                                        && c != theme.palette.accent_pink
-                                        && c != theme.palette.accent_purple
-                                        && c != theme.palette.accent_red
-                                        && c != theme.palette.accent_warm_grey
-                                        && c != theme.palette.accent_yellow
-                                })
-                                .unwrap_or(
-                                    self.custom_accent
-                                        .get_applied_color()
-                                        .unwrap_or_default()
-                                        .into(),
-                                );
-
-                            _ = self.accent_window_hint.update::<app::Message>(
-                                ColorPickerUpdate::ActiveColor(Hsv::from_color(window_hint)),
-                            );
-
-                            self.accent_window_hint.get_applied_color().map(Srgb::from)
-                        },
-                    )
+                    .theme_manager
+                    .selected_customizer()
+                    .set_window_hint(window_hint)
                     .unwrap_or_default();
             }
 
@@ -1205,20 +863,12 @@ impl Page {
 
         // If the theme builder changed, write a new theme to disk on a background thread.
         if needs_build {
-            self.update_accent_palette();
-            let theme_builder = self.theme_builder.clone();
-            let is_dark = self.theme_mode.is_dark;
-            let current_theme = self.theme.clone();
+            let theme_builder = self.theme_manager.builder().clone();
+            let (current_theme, config) = self.theme_manager.selected_customizer().theme.clone();
 
             tasks.push(cosmic::task::future(async move {
-                let config = if is_dark {
-                    Theme::dark_config()
-                } else {
-                    Theme::light_config()
-                };
-
-                if let Ok(config) = config {
-                    let new_theme = theme_builder.build();
+                if let Some(config) = config {
+                let new_theme = theme_builder.build();
 
                     macro_rules! theme_transaction {
                         ($config:ident, $current_theme:ident, $new_theme:ident, { $($name:ident;)+ }) => {
@@ -1254,72 +904,21 @@ impl Page {
                         window_hint;
                     });
 
-                    Message::NewTheme(Box::new(new_theme)).into()
-                } else {
-                    tracing::error!("Failed to get the theme config.");
-                    crate::app::Message::None
-                }
+                Message::NewTheme(Box::new(new_theme)).into()
+            } else {
+                tracing::error!("Failed to get the theme config.");
+                crate::app::Message::None
+            }
             }));
         }
 
-        self.can_reset = if self.theme_mode.is_dark {
-            self.theme_builder != ThemeBuilder::dark()
+        self.can_reset = if self.theme_manager.mode().is_dark {
+            *self.theme_manager.builder() != ThemeBuilder::dark()
         } else {
-            self.theme_builder != ThemeBuilder::light()
+            *self.theme_manager.builder() != ThemeBuilder::light()
         };
 
-        if needs_sync {
-            let theme_builder = self.theme_builder.clone();
-            let is_dark = self.theme_mode.is_dark;
-
-            tokio::task::spawn(async move {
-                if let Err(why) = Self::sync_theme_changes_between_modes(theme_builder, is_dark) {
-                    tracing::error!(?why, "Error syncing theme changes.");
-                }
-            });
-        }
-
         cosmic::Task::batch(tasks)
-    }
-
-    fn update_accent_palette(&mut self) {
-        let palette = self.theme_builder.palette.as_ref();
-        self.accent_palette.theme = vec![
-            palette.accent_blue,
-            palette.accent_indigo,
-            palette.accent_purple,
-            palette.accent_pink,
-            palette.accent_red,
-            palette.accent_orange,
-            palette.accent_yellow,
-            palette.accent_green,
-            palette.accent_warm_grey,
-        ];
-    }
-
-    fn reload_theme_mode(&mut self) {
-        let entity = self.entity;
-        let font_config = std::mem::take(&mut self.font_config);
-        let icon_themes = std::mem::take(&mut self.icon_themes);
-        let icon_handles = std::mem::take(&mut self.icon_handles);
-        let icon_theme_active = self.icon_theme_active.take();
-        let day_time = self.day_time;
-
-        *self = Self::from((
-            self.settings_config.clone(),
-            self.theme_mode_config.take(),
-            self.theme_mode,
-            std::mem::take(&mut self.accent_palette),
-        ));
-
-        self.update_accent_palette();
-
-        self.entity = entity;
-        self.day_time = day_time;
-        self.icon_themes = icon_themes;
-        self.icon_handles = icon_handles;
-        self.icon_theme_active = icon_theme_active;
-        self.font_config = font_config;
     }
 
     fn update_color_picker(
@@ -1353,104 +952,6 @@ impl Page {
         };
 
         (task, needs_update)
-    }
-
-    /// Syncs changes for dark and light theme.
-    /// Roundness and window management settings should be consistent between dark / light mode.
-    fn sync_theme_changes_between_modes(
-        current_theme_builder: ThemeBuilder,
-        is_dark: bool,
-    ) -> Result<(), cosmic::cosmic_config::Error> {
-        let (other_builder_config, other_theme_config) = if is_dark {
-            (ThemeBuilder::light_config()?, Theme::light_config()?)
-        } else {
-            (ThemeBuilder::dark_config()?, Theme::dark_config()?)
-        };
-
-        let mut theme_builder = match ThemeBuilder::get_entry(&other_builder_config) {
-            Ok(t) => t,
-            Err((errs, t)) => {
-                for err in errs {
-                    tracing::error!(?err, "Error loading theme builder");
-                }
-                t
-            }
-        };
-
-        let mut theme = match Theme::get_entry(&other_theme_config) {
-            Ok(t) => t,
-            Err((errs, t)) => {
-                for err in errs {
-                    tracing::error!(?err, "Error loading theme");
-                }
-                t
-            }
-        };
-
-        if theme_builder.active_hint != current_theme_builder.active_hint {
-            if let Err(err) = theme_builder
-                .set_active_hint(&other_builder_config, current_theme_builder.active_hint)
-            {
-                tracing::error!(?err, "Error setting active hint");
-            }
-            if let Err(err) =
-                theme.set_active_hint(&other_theme_config, current_theme_builder.active_hint)
-            {
-                tracing::error!(?err, "Error setting active hint");
-            }
-        }
-
-        if theme_builder.gaps != current_theme_builder.gaps {
-            if let Err(err) =
-                theme_builder.set_gaps(&other_builder_config, current_theme_builder.gaps)
-            {
-                tracing::error!(?err, "Error setting gaps");
-            }
-            if let Err(err) = theme.set_gaps(&other_theme_config, current_theme_builder.gaps) {
-                tracing::error!(?err, "Error setting gaps");
-            }
-        }
-
-        if theme_builder.corner_radii != current_theme_builder.corner_radii {
-            if let Err(err) = theme_builder
-                .set_corner_radii(&other_builder_config, current_theme_builder.corner_radii)
-            {
-                tracing::error!(?err, "Error setting corner radii");
-            }
-
-            if let Err(err) =
-                theme.set_corner_radii(&other_theme_config, current_theme_builder.corner_radii)
-            {
-                tracing::error!(?err, "Error setting corner radii");
-            }
-        }
-
-        if theme_builder.spacing != current_theme_builder.spacing {
-            if let Err(err) =
-                theme_builder.set_spacing(&other_builder_config, current_theme_builder.spacing)
-            {
-                tracing::error!(?err, "Error setting spacing");
-            }
-
-            if let Err(err) = theme.set_spacing(&other_theme_config, current_theme_builder.spacing)
-            {
-                tracing::error!(?err, "Error setting spacing");
-            }
-        }
-
-        Ok(())
-    }
-
-    fn theme_config_write<T: Serialize>(&self, name: &str, value: T) {
-        let config_res = if self.theme_mode.is_dark {
-            Theme::dark_config()
-        } else {
-            Theme::light_config()
-        };
-
-        if let Ok(config) = config_res {
-            _ = config.set(name, value);
-        }
     }
 
     // TODO: cache panel and dock configs so that they needn't be re-read
@@ -1563,7 +1064,7 @@ impl page::Page<crate::pages::Message> for Page {
     #[cfg(feature = "xdg-portal")]
     fn header_view(&self) -> Option<Element<'_, crate::pages::Message>> {
         let content = row::with_capacity(2)
-            .spacing(self.theme_builder.spacing.space_xxs)
+            .spacing(self.theme_manager.builder().spacing.space_xxs)
             .push(button::standard(fl!("import")).on_press(Message::StartImport))
             .push(button::standard(fl!("export")).on_press(Message::StartExport))
             .apply(container)
@@ -1765,27 +1266,24 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
         .view::<Page>(move |_binder, page, section| {
             let Spacing { space_xxs, .. } = cosmic::theme::spacing();
 
+            let customizer = if page.theme_manager.mode().is_dark {
+                &page.theme_manager.dark
+            } else {
+                &page.theme_manager.light
+            };
+
             let descriptions = &section.descriptions;
-            let palette = &page.theme_builder.palette.as_ref();
+            let palette = &page.theme_manager.builder().palette.as_ref();
+            let accent = page.theme_manager.accent_palette().as_ref().unwrap();
             let cur_accent = page
-                .theme_builder
+                .theme_manager
+                .builder()
                 .accent
                 .map_or(palette.accent_blue, Srgba::from);
 
-            let accent_palette_values = match (
-                page.theme_mode.is_dark,
-                page.accent_palette.dark.as_ref(),
-                page.accent_palette.light.as_ref(),
-            ) {
-                (true, Some(dark_palette), _) => &dark_palette,
-                (false, _, Some(light_palette)) => &light_palette,
-                _ => &page.accent_palette.theme,
-            };
+            let mut accent_palette_row = cosmic::widget::row::with_capacity(accent.len());
 
-            let mut accent_palette_row =
-                cosmic::widget::row::with_capacity(accent_palette_values.len());
-
-            for &color in accent_palette_values {
+            for &color in accent {
                 accent_palette_row = accent_palette_row.push(color_button(
                     Some(Message::PaletteAccent(color.into())),
                     color.into(),
@@ -1794,7 +1292,6 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                     48,
                 ));
             }
-
             let accent_color_palette = cosmic::iced::widget::column![
                 text::body(&descriptions[accent_color]),
                 scrollable::horizontal(
@@ -1835,7 +1332,7 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                                 )
                                 .class(button::ButtonClass::Image)
                                 .padding([8, 0])
-                                .selected(page.theme_mode.is_dark)
+                                .selected(page.theme_manager.mode().is_dark)
                                 .on_press(Message::DarkMode(true)),
                                 text::body(&descriptions[dark])
                             ]
@@ -1849,7 +1346,7 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                                         .height(Length::Fixed(100.0))
                                 )
                                 .class(button::ButtonClass::Image)
-                                .selected(!page.theme_mode.is_dark)
+                                .selected(!page.theme_manager.mode().is_dark)
                                 .padding([8, 0])
                                 .on_press(Message::DarkMode(false)),
                                 text::body(&descriptions[light])
@@ -1867,18 +1364,18 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                 .add(
                     settings::item::builder(&descriptions[auto_switch])
                         .description(
-                            if !page.day_time && page.theme_mode.is_dark {
+                            if !page.day_time && page.theme_manager.mode().is_dark {
                                 &page.auto_switch_descs[0]
-                            } else if page.day_time && !page.theme_mode.is_dark {
+                            } else if page.day_time && !page.theme_manager.mode().is_dark {
                                 &page.auto_switch_descs[1]
-                            } else if page.day_time && page.theme_mode.is_dark {
+                            } else if page.day_time && page.theme_manager.mode().is_dark {
                                 &page.auto_switch_descs[2]
                             } else {
                                 &page.auto_switch_descs[3]
                             }
                             .clone(),
                         )
-                        .toggler(page.theme_mode.auto_switch, Message::Autoswitch),
+                        .toggler(page.theme_manager.mode().auto_switch, Message::Autoswitch),
                 )
                 .add(accent_color_palette)
                 .add(
@@ -1931,10 +1428,12 @@ pub fn mode_and_colors() -> Section<crate::pages::Message> {
                         ),
                 )
                 .add(
-                    settings::item::builder(&descriptions[window_hint_toggle])
-                        .toggler(page.no_custom_window_hint, Message::UseDefaultWindowHint),
+                    settings::item::builder(&descriptions[window_hint_toggle]).toggler(
+                        customizer.custom_window_hint().is_some(),
+                        Message::UseDefaultWindowHint,
+                    ),
                 );
-            if !page.no_custom_window_hint {
+            if customizer.custom_window_hint().is_some() {
                 section = section.add(
                     settings::item::builder(&descriptions[window_hint]).control(
                         page.accent_window_hint
@@ -1998,7 +1497,7 @@ pub fn style() -> Section<crate::pages::Message> {
                             cosmic::iced::widget::column![
                                 button::custom(
                                     icon(
-                                        if page.theme_mode.is_dark {
+                                        if page.theme_manager.mode().is_dark {
                                             &dark_round_style
                                         } else {
                                             &light_round_style
@@ -2023,7 +1522,7 @@ pub fn style() -> Section<crate::pages::Message> {
                             cosmic::iced::widget::column![
                                 button::custom(
                                     icon(
-                                        if page.theme_mode.is_dark {
+                                        if page.theme_manager.mode().is_dark {
                                             &dark_slightly_round_style
                                         } else {
                                             &light_slightly_round_style
@@ -2048,7 +1547,7 @@ pub fn style() -> Section<crate::pages::Message> {
                             cosmic::iced::widget::column![
                                 button::custom(
                                     icon(
-                                        if page.theme_mode.is_dark {
+                                        if page.theme_manager.mode().is_dark {
                                             &dark_square_style
                                         } else {
                                             &light_square_style
@@ -2149,8 +1648,8 @@ pub fn window_management() -> Section<crate::pages::Message> {
                 .title(&section.title)
                 .add(settings::item::builder(&descriptions[active_hint]).control(
                     widget::spin_button(
-                        page.theme_builder.active_hint.to_string(),
-                        page.theme_builder.active_hint,
+                        page.theme_manager.builder().active_hint.to_string(),
+                        page.theme_manager.builder().active_hint,
                         1,
                         0,
                         64,
@@ -2159,10 +1658,10 @@ pub fn window_management() -> Section<crate::pages::Message> {
                 ))
                 .add(
                     settings::item::builder(&descriptions[gaps]).control(widget::spin_button(
-                        page.theme_builder.gaps.1.to_string(),
-                        page.theme_builder.gaps.1,
+                        page.theme_manager.builder().gaps.1.to_string(),
+                        page.theme_manager.builder().gaps.1,
                         1,
-                        page.theme_builder.active_hint,
+                        page.theme_manager.builder().active_hint,
                         500,
                         Message::GapSize,
                     )),
