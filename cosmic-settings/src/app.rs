@@ -27,6 +27,7 @@ use cosmic::cctk::{sctk::output::OutputInfo, wayland_client::protocol::wl_output
 use cosmic::{
     Element,
     app::{Core, Task, context_drawer::ContextDrawer},
+    cosmic_theme,
     iced::{
         self, Length, Subscription,
         event::{self, PlatformSpecific},
@@ -52,6 +53,7 @@ use desktop::{
 #[cfg(feature = "wayland")]
 use event::wayland;
 use page::Entity;
+use std::any::TypeId;
 use std::collections::BTreeSet;
 use std::{borrow::Cow, str::FromStr};
 
@@ -166,6 +168,7 @@ pub enum Message {
     SearchClear,
     SearchSubmit,
     SetTheme(cosmic::theme::Theme),
+    SetThemeMode(cosmic::cosmic_theme::ThemeMode),
     SetWindowTitle,
     Surface(surface::Action),
 }
@@ -290,6 +293,7 @@ impl cosmic::Application for SettingsApp {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        struct ThemeSubscription;
         Subscription::batch(vec![
             #[cfg(feature = "ashpd")]
             crate::subscription::daytime().map(|daytime| {
@@ -346,6 +350,21 @@ impl cosmic::Application for SettingsApp {
                 Message::PageMessage(pages::Message::Accessibility(
                     pages::accessibility::Message::DBusUpdate(m),
                 ))
+            }),
+            cosmic_config::config_subscription::<_, cosmic_theme::ThemeMode>(
+                TypeId::of::<ThemeSubscription>(),
+                cosmic_theme::THEME_MODE_ID.into(),
+                cosmic_theme::ThemeMode::version(),
+            )
+            .map(|update| {
+                if !update.errors.is_empty() {
+                    tracing::info!(
+                        "errors loading theme mode {:?}: {:?}",
+                        update.keys,
+                        update.errors
+                    );
+                }
+                Message::SetThemeMode(update.config)
             }),
         ])
     }
@@ -762,7 +781,14 @@ impl cosmic::Application for SettingsApp {
                 }
             }
 
-            Message::SetTheme(t) => return cosmic::command::set_theme(t),
+            Message::SetTheme(t) => {
+                return cosmic::command::set_theme(t);
+            }
+            Message::SetThemeMode(t) => {
+                tracing::info!("New mode was set: {:?}", t);
+
+                return Task::none();
+            }
 
             Message::OpenContextDrawer(page) => {
                 self.core.window.show_context = true;
